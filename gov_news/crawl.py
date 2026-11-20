@@ -47,10 +47,12 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import re
 import sys
 import time
 import unicodedata
+from dataclasses import dataclass, field
 from datetime import datetime
 from html import unescape as html_unescape
 from pathlib import Path
@@ -65,8 +67,17 @@ HERE = Path(__file__).resolve().parent
 SEARCH_TYPES = ("api", "results_page", "browser", "none")
 DEFAULT_SEARCH_PAGES = 5
 MAX_SEARCH_PAGES = 20
+DEFAULT_SEARCH_LIMIT = 300
+DEFAULT_FETCH_LIMIT = 5
+DEFAULT_LIST_PAGES = 3
+MAX_LIST_PAGES = 50
 DEFAULT_DELAY = 1.0
+DEFAULT_TIMEOUT = 30.0
 DEFAULT_DB_NAME = "newscrawl"
+SETTINGS_PATH = HERE / "settings.json"
+# 候选收集的硬护栏：--search-limit 0/负数（不设上限）时也只收这么多，避免 people 这种
+# 站内命中上万条的源把内存和耗时拉爆（超限会打印提醒并停止继续翻页）
+LIST_CANDIDATE_GUARD = 5000
 
 _WS = re.compile(r"\s+")
 _TAG = re.compile(r"<[^>]+>")
@@ -86,9 +97,131 @@ _NOISE_CONTAINER = re.compile(
 
 
 def load_config(path: Path) -> Dict[str, Any]:
-    data = json.loads(path.read_text(encoding="utf-8"))
+    # utf-8-sig：Windows 记事本另存为 UTF-8 会带 BOM，用 utf-8 读会在第 1 列就解析失败
+    data = json.loads(path.read_text(encoding="utf-8-sig"))
     # 允许在 JSON 里写 _readme 之类的注释字段（json 不支持注释，就用下划线键代替）
     return {k: v for k, v in data.items() if not k.startswith("_")}
+
+
+@dataclass
+class RunSettings:
+    """settings.json 的内容（缺字段用内置默认；文件不存在时整份都是默认值）。
+
+    优先级：命令行 > settings.json > 源配置(sources.json) > 代码内置默认。
+    这里只承载 settings 这一层，命令行与源配置的覆盖在 resolve_* 里做。
+    """
+
+    search_pages: int = DEFAULT_SEARCH_PAGES
+    search_limit: int = DEFAULT_SEARCH_LIMIT
+    fetch_limit: int = DEFAULT_FETCH_LIMIT
+    list_pages: int = DEFAULT_LIST_PAGES
+    delay_seconds: float = DEFAULT_DELAY
+    timeout_seconds: float = DEFAULT_TIMEOUT
+    proxy: str = ""
+    db: Dict[str, Any] = field(default_factory=dict)
+    source_overrides: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+
+    def limit_for(self, source_key: str, field: str, fallback: int) -> int:
+        """源级覆盖（source_overrides.<key>.<field>）> settings 全局 > 调用方给的兜底。"""
+        override = (self.source_overrides or {}).get(source_key) or {}
+        value = override.get(field)
+        if value is None:
+            value = getattr(self, field)
+        return int(value if value is not None else fallback)
+
+
+def load_settings(path: Path) -> Tuple[RunSettings, str]:
+    """读 settings.json。文件不存在不报错（全部走源配置/内置默认）；解析失败也不静默吞掉。"""
+    if not path.exists():
+        return RunSettings(), f"{path} 不存在（全部走源配置/内置默认）"
+    try:
+        data = load_config(path)
+    except Exception as exc:  # noqa: BLE001 - 配置错误要大声报错，不能装作没读到
+        return RunSettings(), f"{path} 解析失败：{type(exc).__name__}: {exc}"
+    return (
+        RunSettings(
+            search_pages=int(data.get("search_pages", DEFAULT_SEARCH_PAGES)),
+            search_limit=int(data.get("search_limit", DEFAULT_SEARCH_LIMIT)),
+            fetch_limit=int(data.get("fetch_limit", DEFAULT_FETCH_LIMIT)),
+            list_pages=int(data.get("list_pages", DEFAULT_LIST_PAGES)),
+            delay_seconds=float(data.get("delay_seconds", DEFAULT_DELAY)),
+            timeout_seconds=float(data.get("timeout_seconds", DEFAULT_TIMEOUT)),
+            proxy=str(data.get("proxy") or ""),
+            db=dict(data.get("db") or {}),
+            source_overrides=dict(data.get("source_overrides") or {}),
+        ),
+        str(path),
+    )
+
+
+def resolve_search_limit(args: argparse.Namespace, settings: RunSettings) -> int:
+    """检索阶段每个源最多收多少候选。
+
+    命令行只接受正数（0 = "没传"，回落到 settings）；"不设上限"是 settings 里的 0/负数，
+    此时仍受 LIST_CANDIDATE_GUARD 护栏约束。
+    """
+    return int(args.search_limit) if args.search_limit else int(settings.search_limit)
+
+
+def resolve_fetch_limit(source: Dict[str, Any], args: argparse.Namespace, settings: RunSettings) -> int:
+    """详情抓取篇数：命令行 > settings(source_overrides 带源配置兜底) > settings 全局 > 源配置 limit。
+
+    source_overrides 是给单源调量的旋钮（如 xinhua 走浏览器，单源调小），它要能压过源配置的
+    `limit`，否则调不动。
+    """
+    if args.fetch_limit:
+        return int(args.fetch_limit)
+    source_limit = int(source.get("limit", DEFAULT_FETCH_LIMIT))
+    return max(0, settings.limit_for(source["key"], "fetch_limit", source_limit))
+
+
+def resolve_list_pages(source: Dict[str, Any], args: argparse.Namespace, settings: RunSettings) -> int:
+    """回退列表页翻几页：命令行 > 源配置 > settings(source_overrides) > 内置默认。"""
+    if args.list_pages:
+        pages = int(args.list_pages)
+    elif source.get("list_pages") is not None:
+        pages = int(source["list_pages"])
+    else:
+        pages = settings.limit_for(source["key"], "list_pages", DEFAULT_LIST_PAGES)
+    return max(1, min(MAX_LIST_PAGES, pages))
+
+
+def resolve_delay(args: argparse.Namespace, settings: RunSettings) -> float:
+    return float(args.delay) if args.delay else float(settings.delay_seconds)
+
+
+def resolve_timeout(args: argparse.Namespace, settings: RunSettings) -> float:
+    return float(args.timeout) if args.timeout else float(settings.timeout_seconds)
+
+
+def resolve_global_proxy(args: argparse.Namespace, settings: RunSettings, where: str) -> Optional[str]:
+    """代理地址：命令行 > settings.proxy；最终仍只对 search.proxy=true 的源生效。"""
+    if args.proxy:
+        return args.proxy
+    if settings.proxy:
+        print(f"    （代理来自 {where} 的 proxy：{settings.proxy}；仍只对 search.proxy=true 的源生效）")
+        return settings.proxy
+    return None
+
+
+def resolve_db_params(args: argparse.Namespace, settings: RunSettings) -> Dict[str, Any]:
+    """入库连接参数：命令行 > settings.json 的 db 区块 > db.py 自己的默认。
+
+    **settings.json 的 db 区块只放 host/port/user/name，不放密码**；密码只从
+    `--db-password` 或环境变量 `GOV_NEWS_DB_PASSWORD` 来，没给就交给 db.py 的默认值。
+    """
+    db_conf = settings.db or {}
+    params: Dict[str, Any] = {"db_name": args.db_name or str(db_conf.get("name") or DEFAULT_DB_NAME)}
+    if db_conf.get("host"):
+        params["host"] = str(db_conf["host"])
+    if db_conf.get("port"):
+        params["port"] = int(db_conf["port"])
+    if db_conf.get("user"):
+        params["user"] = str(db_conf["user"])
+    password = args.db_password or os.environ.get("GOV_NEWS_DB_PASSWORD") or ""
+    if password:
+        params["password"] = password
+    return params
 
 
 def load_keywords(args: argparse.Namespace) -> Dict[str, Any]:
@@ -351,15 +484,196 @@ def extract_links(
     return articles
 
 
-def list_articles(html: str, source: Dict[str, Any]) -> List[Dict[str, str]]:
-    """列表页兜底路径：按源配置抽候选。"""
+def list_articles(html: str, source: Dict[str, Any], page_url: str = "") -> List[Dict[str, str]]:
+    """列表页兜底路径：按源配置抽候选。
+
+    基准 URL 必须是**本轮真正请求的那一页**（翻页时是 `index_2.html` 这种），相对链接才补得对；
+    不传则退回源配置的 `url`（首页行为不变）。
+    """
     return extract_links(
         html,
-        source["url"],
+        page_url or source["url"],
         list_selector=source.get("list_selector", "a"),
         link_re=source.get("link_re", ""),
         same_site=True,
     )
+
+
+def _page_template(template: str, source_url: str, page_no: int) -> Optional[str]:
+    """把列表页 URL 套进分页模板，返回第 `page_no` 页的 URL；套不进去返回 None。
+
+    模板有两种写法（都支持）：
+    - 完整 URL：`https://www.ccg.gov.cn/wqzf/index_{page}.html` —— 直接替换 {page}，不再拼接；
+    - 文件名：`index_{page}.html` —— 拼到源 url 的目录上（`…/wqzf/` + `index_2.html`；
+      源 url 是文件时原地换掉文件名，`…/index.htm` + `index_2.htm`）。
+    page_no=1 且模板没写 {page} 时用源 url 本身（首页就是列表首屏）。
+    """
+    if "{page}" not in template:
+        return source_url if page_no == 1 else None
+    if urlparse(template).scheme:
+        return template.replace("{page}", str(page_no))
+    parsed = urlparse(source_url)
+    path = parsed.path
+    if path.endswith("/"):
+        candidate = path + template.replace("{page}", str(page_no))
+    elif "." in path.rsplit("/", 1)[-1]:
+        candidate = path.rsplit("/", 1)[0] + "/" + template.replace("{page}", str(page_no))
+    else:
+        return None
+    return parsed._replace(path=candidate, params="", query="", fragment="").geturl()
+
+
+def derive_page_url_template(source: Dict[str, Any], html: str, page_url: str) -> Optional[str]:
+    """从首页 HTML 里推分页模板，**要求有实证**：返回 None 就只抓第 1 页。
+
+    证据门槛（缺一不可，否则容易把文章链接的分页形似 URL 当成目录分页）：
+    1. 至少 **2 条**同站链接归到同一个模板（href 里数字换 `{page}` 后完全相同）；
+    2. 这些链接的页码里出现 `1` 或 `2`（分页第一页就是 1 或 2 起的 links）。
+
+    反例（2026-11-20 实测）：nanhai 首页第一条带数字的文件名是**文章**链接
+    `https://www.nanhai.org.cn/info-detail/21/18489.html`，只按单条链接推会得出
+    `/info-detail/21/{page}.html` 这种伪模板，翻页翻出来全是 404/空页。所以还要：
+    3. 页码取文件名里**最后一段**数字（不是 `info-detail/21/` 这种目录里的栏目 id），
+       且文件名主干不能整个就是页码（`{page}.html` 不是分页，`index_{page}.html` 才是）。
+    """
+    page = Selector(content=html or "")
+    groups: Dict[str, Dict[str, Any]] = {}
+    for anchor in page.css("a"):
+        href = (anchor.attrib.get("href") or "").strip()
+        if not href or href.startswith(("javascript:", "#", "mailto:")):
+            continue
+        absolute = urljoin(page_url, href).split("#")[0]
+        if not _same_site(absolute, page_url):
+            continue
+        name = urlparse(absolute).path.rsplit("/", 1)[-1]
+        found = re.findall(r"\d+(?=\.[A-Za-z0-9]+$)", name)
+        if not found:
+            continue
+        number = found[-1]
+        template_name = name.replace(number, "{page}")
+        if template_name == "{page}" + name[len(number) :]:
+            continue
+        if _page_template(template_name, source["url"], 2) is None:
+            continue
+        group = groups.setdefault(template_name, {"numbers": [], "hrefs": []})
+        group["numbers"].append(number)
+        group["hrefs"].append(href)
+
+    for template_name, group in groups.items():
+        numbers = set(group["numbers"])
+        if len(numbers) < 2 or not ({"1", "2"} & numbers):
+            continue
+        example = urlparse(urljoin(page_url, group["hrefs"][0])).path
+        head = example.rsplit("/", 1)[0] + "/"
+        return f"{urlparse(page_url).scheme}://{urlparse(page_url).netloc}{head}{template_name}"
+    return None
+
+
+def _articles_since(html: str, source: Dict[str, Any], base_url: str, seen: set) -> List[Dict[str, str]]:
+    """`list_articles` 的增量版本：只保留本轮新增的候选（翻页时按 URL 判重）。"""
+    fresh: List[Dict[str, str]] = []
+    for link in list_articles(html, source, base_url):
+        if link["url"] not in seen:
+            fresh.append(link)
+    return fresh
+
+
+def collect_list_pages(
+    source: Dict[str, Any],
+    args: argparse.Namespace,
+    throttle: Throttle,
+    proxy: Optional[str],
+    list_pages: int,
+    timeout: float,
+) -> Tuple[List[Dict[str, str]], Dict[str, Any]]:
+    """回退列表页：按 `page_url_template` 翻 `list_pages` 页，合并去重。
+
+    **第 1 页也走模板**（配了 `page_url_template` 时），所以「第 1 页」= 模板渲染出的第 1 页
+    （ccg_wqzf 就是 `index_1.html`），而不是无条件先用源 `url`；没配模板才先用源 `url` 抓第 1 页，
+    再从它的 HTML 里推分页模板，推不出来就只抓这 1 页并在报告里注明未翻页。
+    单页失败只记错误、不中断该源。
+    """
+    seen: set = set()
+    collected: List[Dict[str, str]] = []
+    status, html, engine = 0, "", ""
+    pages_done = 0
+    pages_attempted = 0
+    errors: List[str] = []
+    notes: List[str] = []
+    template = str(source.get("page_url_template") or "").strip()
+    page_activity: List[int] = []  # 每页新抽到的候选数（增量）
+
+    first_url = source["url"]
+    start_page = 1
+    if template:
+        rendered = _page_template(template, first_url, 1)
+        if rendered:
+            first_url = rendered
+        else:
+            notes.append(f"模板 {template} 套不进 {first_url}，退回抓源 url 本身且不翻页")
+            template = ""
+    status, html, engine = fetch(first_url, source, timeout=timeout, proxy=proxy)
+    pages_attempted += 1
+    first_page = list_articles(html, source, first_url)
+    pages_done += 1
+    for link in first_page:
+        if link["url"] in seen:
+            continue
+        seen.add(link["url"])
+        collected.append(link)
+    page_activity.append(len(collected))
+
+    if list_pages > 1 and not template:
+        template = derive_page_url_template(source, html, first_url) or ""
+    if not template:
+        notes.append(
+            f"列表翻页={pages_done} 页（未翻页：{'请求的列表页没有可推导的分页链接' if list_pages > 1 else 'list_pages=1'}）"
+        )
+        return collected, {
+            "http_status": status,
+            "engine": engine,
+            "pages_done": pages_done,
+            "pages_attempted": pages_attempted,
+            "errors": errors,
+            "notes": notes,
+            "page_activity": page_activity,
+        }
+
+    for page_no in range(start_page + 1, list_pages + 1):
+        page_url = _page_template(template, first_url, page_no)
+        if not page_url:
+            notes.append(f"模板 {template} 套不进 {first_url}，第 {page_no} 页起停止翻页")
+            break
+        throttle.wait()
+        try:
+            page_status, page_html, _engine = fetch(page_url, source, timeout=timeout, proxy=proxy)
+        except Exception as exc:  # noqa: BLE001 - 单页失败只记错误，不中断该源
+            errors.append(f"列表第 {page_no} 页失败 {page_url}: {type(exc).__name__}: {str(exc)[:120]}")
+            continue
+        pages_attempted += 1
+        if page_status == 404:
+            # 越过最后一页：正常收尾，不当错误（ccg_wqzf 第 24 页起就是 404）
+            notes.append(f"第 {page_no} 页 404，判定已到最后一页，停止翻页")
+            break
+        if page_status != 200:
+            errors.append(f"列表第 {page_no} 页 HTTP {page_status}（按空页处理）：{page_url}")
+        fresh = _articles_since(page_html, source, page_url, seen)
+        seen.update(link["url"] for link in fresh)
+        collected.extend(fresh)
+        pages_done += 1
+        page_activity.append(len(fresh))
+        if page_status == 200:
+            status = page_status
+
+    return collected, {
+        "http_status": status,
+        "engine": engine,
+        "pages_done": pages_done,
+        "pages_attempted": pages_attempted,
+        "errors": errors,
+        "notes": notes,
+        "page_activity": page_activity,
+    }
 
 
 def extract_images(html: str, base_url: str, source: Dict[str, Any], limit: int = 3) -> List[str]:
@@ -464,9 +778,13 @@ def match_level(title: str, body: str, hits: List[str]) -> str:
 # ---------------------------------------------------------------- 站内检索
 
 
-def resolve_pages(search: Dict[str, Any], args: argparse.Namespace) -> int:
-    """检索深度：命令行 --search-pages > 源配置 pages > 默认 5，上限 20。"""
-    pages = int(args.search_pages or search.get("pages") or DEFAULT_SEARCH_PAGES)
+def resolve_pages(search: Dict[str, Any], args: argparse.Namespace, settings: RunSettings) -> int:
+    """检索深度：命令行 --search-pages > 源配置 pages > settings.search_pages > 默认 5，上限 20。
+
+    源配置优先于 settings 是刻意的：xinhua_mil 这类源把 `pages` 压到 1 是为了压住浏览器开销
+    （见 sources.json 的 note），全局 settings 不该把它顶掉；settings 只给没写 `pages` 的源兜底。
+    """
+    pages = int(args.search_pages or search.get("pages") or settings.search_pages or DEFAULT_SEARCH_PAGES)
     return max(1, min(MAX_SEARCH_PAGES, pages))
 
 
@@ -474,13 +792,16 @@ def needs_proxy(source: Dict[str, Any]) -> bool:
     return bool(source.get("proxy") or (source.get("search") or {}).get("proxy"))
 
 
-def resolve_proxy(source: Dict[str, Any], args: argparse.Namespace) -> Optional[str]:
-    """只有配置里声明需要代理的源才用 --proxy；未提供时照常直连（让失败证据真实可见）。"""
+def resolve_proxy(
+    source: Dict[str, Any], args: argparse.Namespace, global_proxy: Optional[str] = None
+) -> Optional[str]:
+    """只有配置里声明需要代理的源才用代理（命令行 --proxy > settings.proxy）；
+    未提供时照常直连（让失败证据真实可见）。国内源永不带代理。"""
     if not needs_proxy(source):
         return None
-    if args.proxy:
-        return args.proxy
-    print(f"    ⚠ {source['key']} 配置要求代理（search.proxy=true），但未传 --proxy：本次直连，预期失败")
+    if global_proxy:
+        return global_proxy
+    print(f"    ⚠ {source['key']} 配置要求代理（search.proxy=true），但未传 --proxy/settings.proxy：本次直连，预期失败")
     return None
 
 
@@ -534,9 +855,19 @@ def _items_to_records(items: List[Any], search: Dict[str, Any], keyword: str) ->
 
 
 def _dedupe_into(
-    collected: List[Dict[str, Any]], records: List[Dict[str, Any]], seen_urls: set, seen_titles: set, limit: int
+    collected: List[Dict[str, Any]],
+    records: List[Dict[str, Any]],
+    seen_urls: set,
+    seen_titles: set,
+    limit: int,
+    guard: Optional[Dict[str, Any]] = None,
 ) -> int:
-    """URL + 归一化标题双去重后并入 collected，返回本次新增条数。"""
+    """URL + 归一化标题双去重后并入 collected，返回本次新增条数。
+
+    `limit` 是**检索收集上限**（--search-limit / settings.search_limit），0 = 不设上限。
+    无论哪种情况，收集到 LIST_CANDIDATE_GUARD 条就置位 `guard["hit"]=True`（并停止本次并入），
+    由调用方跳出翻页循环 —— 避免站内命中上万条的源把内存和耗时拉爆。
+    """
     added = 0
     for record in records:
         key = title_key(record["title"])
@@ -549,6 +880,10 @@ def _dedupe_into(
         added += 1
         if limit and len(collected) >= limit:
             break
+        if len(collected) >= LIST_CANDIDATE_GUARD:
+            if guard is not None:
+                guard["hit"] = True
+            break
     return added
 
 
@@ -556,12 +891,15 @@ def search_via_api(
     source: Dict[str, Any],
     keywords: List[str],
     pages: int,
-    limit: int,
+    search_limit: int,
     proxy: Optional[str],
     throttle: Throttle,
     args: argparse.Namespace,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """api 型检索：GET/POST + query/JSON body + 自定义头，``{keyword}``/``{page}`` 占位。"""
+    """api 型检索：GET/POST + query/JSON body + 自定义头，``{keyword}``/``{page}`` 占位。
+
+    这里**只受 search_limit（收集上限）约束**，与"每源抓几篇详情"（fetch_limit）无关。
+    """
     search = source["search"]
     method = str(search.get("method", "GET")).upper()
     url = search["url"]
@@ -575,7 +913,7 @@ def search_via_api(
     seen_titles: set = set()
     totals: Dict[str, int] = {}
     status = 0
-
+    guard = {"hit": False}
     for keyword in keywords:
         for page_no in range(page_start, page_start + pages):
             params = _render(search.get("params") or {}, keyword, page_no) or None
@@ -613,13 +951,15 @@ def search_via_api(
             if not items:
                 break
             # 频道型源（mod_qwfb / people_mil）本页可能一条都不属于本频道，继续翻下一页
-            _dedupe_into(collected, _items_to_records(items, search, keyword), seen_urls, seen_titles, limit)
-            if limit and len(collected) >= limit:
+            _dedupe_into(
+                collected, _items_to_records(items, search, keyword), seen_urls, seen_titles, search_limit, guard
+            )
+            if guard["hit"] or (search_limit and len(collected) >= search_limit):
                 break
-        if limit and len(collected) >= limit:
+        if guard["hit"] or (search_limit and len(collected) >= search_limit):
             break
 
-    meta = {"http_status": status, "total_by_keyword": totals, "method": method}
+    meta = {"http_status": status, "total_by_keyword": totals, "method": method, "guard_hit": guard["hit"]}
     return collected, meta
 
 
@@ -627,7 +967,7 @@ def search_via_results_page(
     source: Dict[str, Any],
     keywords: List[str],
     pages: int,
-    limit: int,
+    search_limit: int,
     proxy: Optional[str],
     throttle: Throttle,
     args: argparse.Namespace,
@@ -642,6 +982,7 @@ def search_via_results_page(
     seen_urls: set = set()
     seen_titles: set = set()
     status = 0
+    guard = {"hit": False}
 
     for keyword in keywords:
         # 结果页没有可用的翻页参数（调研未观察到），每个词固定只取第一页
@@ -669,11 +1010,11 @@ def search_via_results_page(
             }
             for link in links
         ]
-        _dedupe_into(collected, records, seen_urls, seen_titles, limit)
-        if limit and len(collected) >= limit:
+        _dedupe_into(collected, records, seen_urls, seen_titles, search_limit, guard)
+        if guard["hit"] or (search_limit and len(collected) >= search_limit):
             break
 
-    return collected, {"http_status": status, "total_by_keyword": {}, "method": "GET"}
+    return collected, {"http_status": status, "total_by_keyword": {}, "method": "GET", "guard_hit": guard["hit"]}
 
 
 def _build_page_action(spec: Optional[Dict[str, Any]], keyword: str) -> Optional[Callable[..., Any]]:
@@ -740,7 +1081,7 @@ def search_via_browser(
     source: Dict[str, Any],
     keywords: List[str],
     pages: int,
-    limit: int,
+    search_limit: int,
     proxy: Optional[str],
     throttle: Throttle,
     args: argparse.Namespace,
@@ -761,6 +1102,7 @@ def search_via_browser(
     totals: Dict[str, int] = {}
     errors: List[str] = []
     status = 0
+    guard = {"hit": False}
 
     session_kwargs: Dict[str, Any] = dict(
         headless=True,
@@ -855,27 +1197,39 @@ def search_via_browser(
                     break
 
                 records = _items_to_records(items, search, keyword)
-                _dedupe_into(collected, records, seen_urls, seen_titles, limit)
-                if limit and len(collected) >= limit:
+                _dedupe_into(collected, records, seen_urls, seen_titles, search_limit, guard)
+                if guard["hit"] or (search_limit and len(collected) >= search_limit):
                     break
-            if limit and len(collected) >= limit:
+            if guard["hit"] or (search_limit and len(collected) >= search_limit):
                 break
 
-    return collected, {"http_status": status, "total_by_keyword": totals, "method": "browser", "errors": errors}
+    return collected, {
+        "http_status": status,
+        "total_by_keyword": totals,
+        "method": "browser",
+        "errors": errors,
+        "guard_hit": guard["hit"],
+    }
 
 
 def collect_candidates(
     source: Dict[str, Any],
     keywords: List[str],
-    limit: int,
+    search_limit: int,
     args: argparse.Namespace,
     throttle: Throttle,
     proxy: Optional[str],
+    list_pages: int = 1,
+    timeout: float = DEFAULT_TIMEOUT,
+    settings: Optional[RunSettings] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """取候选：站内检索优先，失败/为空/无检索时回退列表页。返回 (候选, 路线说明)。"""
+    """取候选：站内检索优先，失败/为空/无检索时回退列表页（并可翻页）。返回 (候选, 路线说明)。
+
+    `search_limit` 只管**收集**多少候选；抓多少篇详情由调用方按 fetch_limit 截取，两者互不影响。
+    """
     search = source.get("search") or {}
     search_type = str(search.get("type") or "none")
-    pages = resolve_pages(search, args)
+    pages = resolve_pages(search, args, settings or RunSettings())
     errors: List[str] = []
     notes: List[str] = []
 
@@ -884,12 +1238,17 @@ def collect_candidates(
         "pages": pages,
         "search_hits": 0,
         "list_candidates": 0,
+        "collected": 0,
+        "guard_hit": False,
         "total_by_keyword": {},
         "http_status": 0,
         "fallback": False,
         "route": "none",
         "label": "无站内检索",
         "list_engine": "",
+        "list_pages_done": 0,
+        "list_pages_requested": list_pages,
+        "list_page_activity": [],
         "errors": errors,
         "notes": notes,
     }
@@ -907,11 +1266,19 @@ def collect_candidates(
             runner = {"api": search_via_api, "results_page": search_via_results_page, "browser": search_via_browser}[
                 search_type
             ]
-            items, sub = runner(source, keywords, pages, limit, proxy, throttle, args)
+            items, sub = runner(source, keywords, pages, search_limit, proxy, throttle, args)
             meta["http_status"] = sub.get("http_status", 0)
             meta["total_by_keyword"] = sub.get("total_by_keyword", {})
             meta["search_hits"] = len(items)
+            meta["collected"] = len(items)
+            meta["guard_hit"] = bool(sub.get("guard_hit"))
             errors.extend(sub.get("errors", []))
+            if meta["guard_hit"]:
+                # 护栏触发不是错误：站内命中量级本身超过我们愿意承担的范围，收下已拿到的候选
+                notes.append(
+                    f"⚠ 单源候选已达护栏 {LIST_CANDIDATE_GUARD} 条：打印提醒并停止继续翻页"
+                    f"（--search-limit 0 时也有这条护栏）"
+                )
             if search_type == "api":
                 meta["label"] = f"api({sub.get('method', 'GET')})"
             if items:
@@ -924,11 +1291,15 @@ def collect_candidates(
     # 回退列表页：站内检索不可用、失败、或 0 条
     meta["fallback"] = True
     try:
-        status, html, engine = fetch(source["url"], source, timeout=args.timeout, proxy=proxy)
-        candidates = list_articles(html, source)
-        meta["http_status"] = status
-        meta["list_engine"] = engine
-        meta["list_candidates"] = len(candidates)
+        candidates, list_meta = collect_list_pages(source, args, throttle, proxy, list_pages, timeout)
+        meta["http_status"] = list_meta["http_status"]
+        meta["list_engine"] = list_meta["engine"]
+        meta["list_candidates"] = len({item["url"] for item in candidates})
+        meta["collected"] = meta["list_candidates"]
+        meta["list_pages_done"] = list_meta["pages_done"]
+        meta["list_page_activity"] = list_meta["page_activity"]
+        errors.extend(list_meta["errors"])
+        notes.extend(list_meta["notes"])
         meta["route"] = "list"
         meta["label"] = f"{meta['label']}→回退列表页"
         return candidates, meta
@@ -1041,7 +1412,7 @@ def status_of(meta: Dict[str, Any], errors: List[str]) -> str:
 def print_source_report(stat: Dict[str, Any]) -> None:
     print(f"\n[{stat['name']}/{stat['key']}] 检索方式={stat['label']} 状态={stat['status']}")
     print(
-        f"    检索命中={stat['search_hits']}  详情抓取={stat['fetched']}  "
+        f"    站内总数={stat['total_label']}  收集候选={stat['collected']}  详情抓取={stat['fetched']}  "
         f"入库={stat['stored_label']}  错误={len(stat['errors'])}  耗时 {stat['elapsed']:.1f}s"
     )
     if stat["detail"]:
@@ -1061,13 +1432,15 @@ def print_summary(
     total_kept: int,
     dump_path: Optional[Path],
     list_only: bool,
+    candidate_total: int = 0,
 ) -> None:
     print(f"\n===== 汇总（{elapsed}s，批次 {batch_time}）=====")
     header = (
         _pad("源", 24)
-        + _pad("检索方式", 36)
+        + _pad("检索方式", 34)
         + _pad("状态", 12)
-        + _pad("检索命中", 10)
+        + _pad("站内总数", 22)
+        + _pad("收集候选", 10)
         + _pad("详情抓取", 10)
         + _pad("入库", 12)
         + _pad("错误", 6)
@@ -1078,9 +1451,10 @@ def print_summary(
     for stat in stats:
         print(
             _pad(stat["name"], 24)
-            + _pad(stat["label"], 36)
+            + _pad(stat["label"], 34)
             + _pad(stat["status"], 12)
-            + _pad(str(stat["search_hits"]), 10)
+            + _pad(stat["total_label"], 22)
+            + _pad(str(stat["collected"]), 10)
             + _pad(str(stat["fetched"]), 10)
             + _pad(stat["stored_label"], 12)
             + _pad(str(len(stat["errors"])), 6)
@@ -1089,9 +1463,7 @@ def print_summary(
     failed = [s for s in stats if s["status"] == "失败"]
     no_result = [s for s in stats if s["status"] == "检索无结果"]
     kept_text = (
-        f"共列出候选 {sum(s['search_hits'] + s['list_candidates'] for s in stats)} 篇（--list-only，未抓详情/未入库）"
-        if list_only
-        else f"共保留 {total_kept} 篇"
+        f"共列出候选 {candidate_total} 篇（--list-only，未抓详情/未入库）" if list_only else f"共保留 {total_kept} 篇"
     )
     print(f"\n{kept_text}；失败源 {len(failed)} 个{'：' + ', '.join(s['key'] for s in failed) if failed else ''}")
     if no_result:
@@ -1103,7 +1475,7 @@ def print_summary(
 # ---------------------------------------------------------------- 主流程
 
 
-def run_from_json(args: argparse.Namespace) -> int:
+def run_from_json(args: argparse.Namespace, db_params: Optional[Dict[str, Any]] = None) -> int:
     """--from-json：把已有 JSON 回灌入库（这条路径只做入库，不抓取）。"""
     path = Path(args.from_json)
     if not path.exists():
@@ -1114,9 +1486,10 @@ def run_from_json(args: argparse.Namespace) -> int:
         print(f"❌ 无法回灌：{err}")
         return 2
     batch_time = datetime.now().isoformat(timespec="seconds")
-    print(f"回灌 {path} -> db_name={args.db_name} batch_time={batch_time}")
+    params = dict(db_params or {})
+    print(f"回灌 {path} -> db_name={params.get('db_name', DEFAULT_DB_NAME)} batch_time={batch_time}")
     try:
-        conn = module.connect(db_name=args.db_name)
+        conn = module.connect(**params)
     except Exception as exc:
         print(f"❌ 无法回灌：连接数据库失败 {type(exc).__name__}: {exc}")
         return 2
@@ -1134,8 +1507,39 @@ def main() -> int:
     )
     parser.add_argument("--config", default=str(HERE / "sources.json"))
     parser.add_argument("--keywords", default=str(HERE / "keywords.json"))
+    parser.add_argument(
+        "--settings",
+        default=str(SETTINGS_PATH),
+        help=f"每轮运行的全局参数文件（默认 {SETTINGS_PATH.name}；不存在则全部走源配置/内置默认）",
+    )
     parser.add_argument("--sources", default="", help="只跑指定源（key 逗号分隔），默认全部启用的源")
-    parser.add_argument("--limit", type=int, default=0, help="每源最多几篇（0=用配置里的 limit）")
+    parser.add_argument(
+        "--limit",
+        "--fetch-limit",
+        dest="fetch_limit",
+        type=int,
+        default=0,
+        help=(
+            "每源抓多少篇详情（0=用 settings/源配置）。--limit 是它的向后兼容别名；"
+            "本参数**不再截断候选收集**（那是 --search-limit 的事）"
+        ),
+    )
+    parser.add_argument(
+        "--search-limit",
+        type=int,
+        default=0,
+        help=(
+            f"每源检索阶段最多收集多少候选。不传（或传 0）=用 settings.search_limit；"
+            f"要把某轮设成不设上限，只能在 settings 里把 search_limit 写成 0/负数（仍受 "
+            f"{LIST_CANDIDATE_GUARD} 条护栏约束）"
+        ),
+    )
+    parser.add_argument(
+        "--list-pages",
+        type=int,
+        default=0,
+        help=f"回退列表页最多翻几页（0=用 settings/源配置；上限 {MAX_LIST_PAGES}）",
+    )
     parser.add_argument(
         "--keyword", default="", help="临时覆盖本次的检索词，同时替换 keywords.json 的 global 过滤词（逗号分隔）"
     )
@@ -1146,24 +1550,63 @@ def main() -> int:
     parser.add_argument(
         "--search-pages", type=int, default=0, help=f"每个检索词翻几页（0=用源配置，上限 {MAX_SEARCH_PAGES}）"
     )
-    parser.add_argument("--delay", type=float, default=DEFAULT_DELAY, help="请求间隔秒数（≥1，默认 1.0）")
-    parser.add_argument("--proxy", default="", help="代理地址，只对配置里 search.proxy=true 的源生效")
+    parser.add_argument(
+        "--delay",
+        type=float,
+        default=0.0,
+        help=f"请求间隔秒数（≥1；0=用 settings.delay_seconds，内置 {DEFAULT_DELAY}）",
+    )
+    parser.add_argument(
+        "--proxy",
+        default="",
+        help="代理地址，只对配置里 search.proxy=true 的源生效（传空则用 settings.proxy，同样只给这些源）",
+    )
     parser.add_argument("--no-db", action="store_true", help="不写库（只做检索/报告，便于离线验证）")
     parser.add_argument("--dump-records", default="", help="把本轮结果导出到指定 JSON 路径（默认不导出）")
     parser.add_argument("--from-json", default="", help="不抓取，直接把指定 JSON 回灌入库")
-    parser.add_argument("--db-name", default=DEFAULT_DB_NAME, help=f"MySQL 库名（默认 {DEFAULT_DB_NAME}）")
-    parser.add_argument("--timeout", type=float, default=30.0, help="单个请求超时秒数")
+    parser.add_argument(
+        "--db-name", default="", help=f"MySQL 库名（默认用 settings.json 的 db.name，其次 {DEFAULT_DB_NAME}）"
+    )
+    parser.add_argument(
+        "--db-password",
+        default="",
+        help="MySQL 密码（默认取 GOV_NEWS_DB_PASSWORD 环境变量，其次 db.py 的默认值；不写进 settings.json）",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=0.0,
+        help=f"单个请求超时秒数（0=用 settings.timeout_seconds，内置 {DEFAULT_TIMEOUT}）",
+    )
     parser.add_argument("--verbose", action="store_true", help="打印每个请求的 INFO 日志（默认只留报告）")
     args = parser.parse_args()
 
     logging.getLogger("scrapling").setLevel(logging.INFO if args.verbose else logging.WARNING)
 
-    if args.delay < 1:
-        parser.error("--delay 必须 ≥ 1（对国内站点的礼貌间隔）")
+    settings_path = Path(args.settings)
+    settings, settings_note = load_settings(settings_path)
+    if not settings_path.exists():
+        print(f"⚠ 未找到 settings 文件：{settings_note}")
+    elif "解析失败" in settings_note:
+        # 文件在但坏了：绝不能静默降级成内置默认值，否则用户以为参数生效了
+        print(f"⚠ settings 文件存在但读不了：{settings_note}")
+        print("⚠ 本轮全部走源配置/内置默认；请修好该文件或换 --settings 指向另一份")
     if args.search_pages and not 1 <= args.search_pages <= MAX_SEARCH_PAGES:
         parser.error(f"--search-pages 取值范围 1~{MAX_SEARCH_PAGES}")
+    if args.list_pages and not 1 <= args.list_pages <= MAX_LIST_PAGES:
+        parser.error(f"--list-pages 取值范围 1~{MAX_LIST_PAGES}")
+    if args.search_limit < 0 and not (settings.search_limit and settings.search_limit < 0):
+        parser.error("--search-limit 只接受 0（用 settings）或正数；'不设上限'请把 settings.search_limit 设为 0/负数")
+    delay = resolve_delay(args, settings)
+    timeout = resolve_timeout(args, settings)
+    search_limit = resolve_search_limit(args, settings)
+    if delay < 1:
+        parser.error(f"--delay（或 settings.delay_seconds={settings.delay_seconds}）必须 ≥ 1（对国内站点的礼貌间隔）")
+    if timeout <= 0:
+        parser.error(f"--timeout（或 settings.timeout_seconds={settings.timeout_seconds}）必须 > 0")
+    db_params = resolve_db_params(args, settings)
     if args.from_json:
-        return run_from_json(args)
+        return run_from_json(args, db_params)
 
     config = load_config(Path(args.config))
     keywords = load_keywords(args)
@@ -1178,12 +1621,14 @@ def main() -> int:
         db_note = "跳过（--no-db）"
     else:
         db_module, db_err = load_db_module()
-        db_note = f"已就绪（库 {args.db_name}）" if db_module else f"未就绪：{db_err}"
+        db_note = f"已就绪（库 {db_params['db_name']}）" if db_module else f"未就绪：{db_err}"
     stored_label_none = "0(未就绪)" if not args.no_db and not db_module else "0(未入库)"
 
     batch_time = datetime.now().isoformat(timespec="seconds")
-    throttle = Throttle(args.delay)
+    throttle = Throttle(delay)
+    global_proxy = resolve_global_proxy(args, settings, str(settings_path))
     print(f"配置：{args.config}")
+    print(f"设置：{settings_note}")
     keyword_source = "命令 --keyword 覆盖" if args.keyword else "keywords.json global"
     print(f"检索词兼过滤词（{keyword_source}）：{keywords['global']}")
     print(
@@ -1191,10 +1636,20 @@ def main() -> int:
         f"{ {k: v for k, v in keywords['per_source'].items() if k in [s['key'] for s in sources]} }"
     )
     print(f"         exclude={keywords['exclude']}  match={keywords['match']}")
-    print(
-        f"检索深度：每词默认 5 页（源可覆盖，上限 {MAX_SEARCH_PAGES}）；请求间隔 {args.delay}s；"
-        f"代理：{'已提供（仅 search.proxy=true 的源使用）' if args.proxy else '未提供'}"
+    search_limit_text = (
+        f"{search_limit}（不设上限，仅受 {LIST_CANDIDATE_GUARD} 条护栏约束）"
+        if search_limit <= 0
+        else str(search_limit)
     )
+    print(
+        f"检索深度：每词默认 {DEFAULT_SEARCH_PAGES} 页（源可覆盖，上限 {MAX_SEARCH_PAGES}）；"
+        f"收集上限 search-limit={search_limit_text}；请求间隔 {delay}s；超时 {timeout}s"
+    )
+    print(
+        f"详情抓取：fetch-limit 默认 {settings.fetch_limit}（源配置/source_overrides 可覆盖，命令行可覆盖）；"
+        f"列表页默认翻 {settings.list_pages} 页"
+    )
+    print(f"代理：{'已提供（仅 search.proxy=true 的源使用）' if global_proxy else '未提供'}")
     print(f"入库：{db_note}")
     print(f"批次时间：{batch_time}")
     print(f"待抓 {len(sources)} 个源：{', '.join(s['name'] for s in sources)}")
@@ -1205,7 +1660,7 @@ def main() -> int:
     conn = None
     if db_module is not None:
         try:
-            conn = db_module.connect(db_name=args.db_name)
+            conn = db_module.connect(**db_params)
         except Exception as exc:
             db_note = f"连接失败：{type(exc).__name__}: {exc}（本轮跳过入库）"
             stored_label_none = "0(连接失败)"
@@ -1214,7 +1669,8 @@ def main() -> int:
 
     try:
         for source in sources:
-            limit = args.limit or source.get("limit", 5)
+            fetch_limit = resolve_fetch_limit(source, args, settings)
+            list_pages = resolve_list_pages(source, args, settings)
             stat: Dict[str, Any] = {
                 "key": source["key"],
                 "name": source["name"],
@@ -1222,6 +1678,9 @@ def main() -> int:
                 "status": "失败",
                 "search_hits": 0,
                 "list_candidates": 0,
+                "collected": 0,
+                "total_label": "-",
+                "list_pages": 0,
                 "fetched": 0,
                 "stored": 0,
                 "stored_label": stored_label_none,
@@ -1232,30 +1691,57 @@ def main() -> int:
                 "notes": [],
             }
             t0 = time.perf_counter()
-            proxy = resolve_proxy(source, args)
-            candidates, meta = collect_candidates(source, keywords["global"], limit, args, throttle, proxy)
+            proxy = resolve_proxy(source, args, global_proxy)
+            candidates, meta = collect_candidates(
+                source, keywords["global"], search_limit, args, throttle, proxy, list_pages, timeout, settings
+            )
             stat["label"] = meta["label"]
             stat["search_hits"] = meta["search_hits"]
             stat["list_candidates"] = meta["list_candidates"]
+            stat["collected"] = meta["collected"]
+            stat["list_pages"] = meta["list_pages_done"]
             stat["errors"] = list(meta["errors"])
             stat["notes"] = list(meta["notes"])
+            # 状态要在这里先算一次：--list-only 不抓详情，末尾那次计算不会执行，
+            # 不先算就会把还没覆盖的初始值 "失败" 打进报告
+            stat["status"] = status_of(meta, stat["errors"])
+
+            totals = meta["total_by_keyword"]
+            if totals:
+                stat["total_label"] = " ".join(f"{k}:{v}" for k, v in totals.items())
+            elif meta["fallback"]:
+                # 回退源的"站内总数"没有服务端数字，这里如实标成列表候选口径
+                stat["total_label"] = f"列表(未检索)={meta['list_candidates']}"
 
             detail_bits = []
             if meta["search_type"] != "none":
                 detail_bits.append(f"检索={meta['search_type']} 页数={meta['pages']}")
-            if meta["total_by_keyword"]:
-                detail_bits.append("站内总数=" + " ".join(f"{k}:{v}" for k, v in meta["total_by_keyword"].items()))
+            if totals:
+                detail_bits.append("站内总数=" + " ".join(f"{k}:{v}" for k, v in totals.items()))
+            detail_bits.append(f"收集候选={meta['collected']}")
             if meta["fallback"]:
-                detail_bits.append(f"列表候选={meta['list_candidates']} 列表引擎={meta['list_engine'] or '-'}")
+                detail_bits.append(
+                    f"列表翻页={meta['list_pages_done']} 页（请求最多 {meta['list_pages_requested']} 页 / 候选 "
+                    f"{meta['list_candidates']} 条）列表引擎={meta['list_engine'] or '-'}"
+                )
                 # 回退路径的过滤词在启动横幅里只打了本批源的字面量，这里给出该源实际用的那份（去重后）
                 detail_bits.append(f"过滤词={format_words(fallback_filter_words(keywords, source['key']))}")
             detail_bits.append(f"HTTP={meta['http_status']}")
             stat["detail"] = "｜".join(detail_bits)
 
             source_records: List[Dict[str, Any]] = []
-            picked = candidates[:limit]
+            picked = candidates[:fetch_limit] if fetch_limit else []
             if args.list_only:
-                print(f"\n[{source['name']}/{source['key']}] 检索方式={stat['label']} （--list-only）")
+                print(
+                    f"\n[{source['name']}/{source['key']}] 检索方式={stat['label']} 状态={stat['status']}\n"
+                    f"    站内总数={stat['total_label']}  收集候选={meta['collected']}  "
+                    f"列表展示前 {len(picked)} 条（--list-only）\n"
+                    f"    {stat['detail']}"
+                )
+                for note in stat["notes"][:3]:
+                    print(f"    · {note}")
+                for err in stat["errors"][:3]:
+                    print(f"    ! {err}")
                 for idx, item in enumerate(picked, 1):
                     print(f"    {idx}. {item['title'][:40]} -> {item['url'][:80]}")
             else:
@@ -1270,9 +1756,7 @@ def main() -> int:
                 for item in picked:
                     try:
                         throttle.wait()
-                        detail_status, detail_html, _ = fetch(
-                            item["url"], detail_source, timeout=args.timeout, proxy=proxy
-                        )
+                        detail_status, detail_html, _ = fetch(item["url"], detail_source, timeout=timeout, proxy=proxy)
                         parsed = parse_article(detail_html, source)
                         images = extract_images(detail_html, item["url"], source, limit=3)
                         title = strip_html(parsed["title"] or item["title"])
@@ -1385,7 +1869,15 @@ def main() -> int:
             encoding="utf-8",
         )
 
-    print_summary(stats, elapsed, batch_time, len(all_records), dump_path, args.list_only)
+    print_summary(
+        stats,
+        elapsed,
+        batch_time,
+        len(all_records),
+        dump_path,
+        args.list_only,
+        candidate_total=sum(s["collected"] for s in stats),
+    )
     return 1 if any(s["status"] == "失败" for s in stats) else 0
 
 

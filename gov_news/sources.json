@@ -14,6 +14,10 @@
     "  body_selector  详情页正文容器；留空则用启发式自动找（不保证准，建议显式配置）",
     "  limit          每个源最多抓几篇（默认值，可被命令行 --limit 覆盖）",
     "  min_body_length 正文短于此字数就丢弃（过滤「记者会索引页/图片快讯」这类空壳）",
+    "  list_pages     回退列表页最多翻几页（默认取 settings.json 的 list_pages；--list-pages 可临时覆盖）",
+    "  page_url_template 回退列表页的分页 URL 模板（含 {page}），只写文件名部分或整体 URL 都行：",
+    "                 如 index_{page}.html 会套到源 url 的目录上（…/wqzf/ + index_{page}.html）；",
+    "                 不写则从首页 HTML 里实测推导分页链接，推不出来就只抓第 1 页并在报告里注明未翻页",
     "  note           本源的坑，写在这里免得下次重踩",
     "字段说明（站内检索路径 search）：",
     "  search.type      api=可直接请求的 JSON 接口 / results_page=可 GET 的结果页 / browser=必须真实浏览器 / none=确认无站内检索",
@@ -223,11 +227,13 @@
       "title_selector": "div.section-cnt-tit, h1",
       "body_selector": "div.trs_editor_view, div.article-main",
       "limit": 5,
+      "list_pages": 3,
+      "page_url_template": "https://www.ccg.gov.cn/wqzf/index_{page}.html",
       "search": {
         "type": "none",
         "note": "站点级检索与 ccg 同一个（且不可用）；栏目页 /wqzf/ 无检索表单"
       },
-      "note": "专栏用 /wqzf/（带 index.html 的地址会超时，用目录形式）；有分页 index_1.html…index_23.html"
+      "note": "专栏用 /wqzf/（带 index.html 的地址会超时，用目录形式）；分页实测 2026-11-20（gov_news/out/probe_list_pagination_ccg_wqzf_*.json）：/wqzf/ 与 /wqzf/index.html 都是 200 且 19 条候选（含底部「点击排行」重复区），index_1.html=200/29 条、index_2.html=200/29 条、index_23.html=200/19 条，index_0.html / index_24.html / index_25.html 均 404 —— 所以有效分页是 index_1.html…index_23.html（23 页）。page_url_template 直接用 index_{page}.html 形态、从第 1 页起取，不再抓 /wqzf/ 目录页：目录页多出来的都是「点击排行」里与栏目列表重复的链接（翻页合并时会被去重），反而多一次请求"
     },
     {
       "key": "scspi",
