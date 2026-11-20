@@ -1,10 +1,10 @@
 {
   "_readme": [
     "源清单：增删本条目的 sources 数组即可，不需要改代码。",
-    "字段说明：",
+    "字段说明（列表页兜底路径）：",
     "  key            机器名（产物里的 source 字段）",
     "  name           显示名",
-    "  url            列表页地址",
+    "  url            列表页地址（站内检索失败时的回退入口）",
     "  enabled        是否启用（false = 暂时关掉但不删）",
     "  engine         static=HTTP直取（快） / browser=隐身浏览器（慢但能过 JS/反爬）",
     "  verify         SSL 证书是否校验。mod.gov.cn、81.mil.cn 的证书与域名不匹配，必须 false",
@@ -13,7 +13,28 @@
     "  title_selector 详情页标题选择器；留空则按 h1 -> <title> 依次兜底",
     "  body_selector  详情页正文容器；留空则用启发式自动找（不保证准，建议显式配置）",
     "  limit          每个源最多抓几篇（默认值，可被命令行 --limit 覆盖）",
-    "  note           本源的坑，写在这里免得下次重踩"
+    "  min_body_length 正文短于此字数就丢弃（过滤「记者会索引页/图片快讯」这类空壳）",
+    "  list_pages     回退列表页最多翻几页（默认取 settings.json 的 list_pages；--list-pages 可临时覆盖）",
+    "  page_url_template 回退列表页的分页 URL 模板（含 {page}），只写文件名部分或整体 URL 都行：",
+    "                 如 index_{page}.html 会套到源 url 的目录上（…/wqzf/ + index_{page}.html）；",
+    "                 不写则从首页 HTML 里实测推导分页链接，推不出来就只抓第 1 页并在报告里注明未翻页",
+    "  note           本源的坑，写在这里免得下次重踩",
+    "字段说明（站内检索路径 search）：",
+    "  search.type      api=可直接请求的 JSON 接口 / results_page=可 GET 的结果页 / browser=必须真实浏览器 / none=确认无站内检索",
+    "  search.method    api 型用 GET 或 POST（people 是 POST）",
+    "  search.url       api 型接口地址；results_page/browser 型用 search.url_template",
+    "  search.url_template  支持 {keyword} 与 {page} 两个占位符（{keyword} 会自动 percent-encode）",
+    "  search.js_fetch  浏览器型专用：先打开 url_template 这个页面，再在页面上下文里 fetch js_fetch.url_template（取数接口静态直调 403 的站点只能这样，且能正常翻页）",
+    "  search.xhr_url_re  浏览器型备选：从会话录到的 XHR 里按这个正则找最近一条 JSON 响应",
+    "  search.params    GET 查询参数（支持 {keyword}/{page}）；search.body 是 POST 的 JSON body",
+    "  search.headers   自定义请求头（people 需要 Origin/Referer）",
+    "  search.pages     每个检索词翻几页（默认 5，上限 20，--search-pages 可临时覆盖）",
+    "  search.page_start 页码起点（这些站点都是 1 起）",
+    "  search.*_path    JSON 取值路径（items_path/total_path）、字段映射（title_field/url_field/...）",
+    "  search.link_re / search.url_prefixes  检索后的二次过滤（频道型源靠它收窄到本频道）",
+    "  search.proxy     该源是否需要代理（只有 scspi 为 true；地址由命令行 --proxy 提供）",
+    "  search.unavailable / search.unavailable_reason  调研已确认取不到结果时留档，运行时直接回退列表页",
+    "  search.note     本源的检索坑，写在这里"
   ],
   "sources": [
     {
@@ -28,6 +49,37 @@
       "title_selector": "h1",
       "body_selector": ".article-content",
       "limit": 5,
+      "min_body_length": 60,
+      "search": {
+        "type": "api",
+        "method": "GET",
+        "url": "http://mod-search.mod.gov.cn/api-surface/es/docSearchEasy",
+        "verify": false,
+        "proxy": false,
+        "timeout": 25,
+        "params": {
+          "pageNumber": "{page}",
+          "pageSize": 10,
+          "returnFields": "",
+          "indexNames": "manuscript",
+          "highlightType": 2,
+          "title": "{keyword}",
+          "searchType": 2,
+          "channelId": 718
+        },
+        "pages": 5,
+        "page_start": 1,
+        "items_path": "data.resultList",
+        "total_path": "data.total",
+        "title_field": "title",
+        "url_field": "manuscriptData.url",
+        "date_field": "issueTime",
+        "summary_field": "desc",
+        "category_field": "manuscriptData.classify_name",
+        "link_re": "mod\\.gov\\.cn/.+\\d{6,}\\.html$",
+        "search_by": "title（searchType 2=模糊，channelId 718=国防部网主站）",
+        "note": "接口是从站点 index.js 里扒出来的；返回标题带 <span style=color:red> 高亮，入库前必须 strip_html"
+      },
       "note": "证书 CN 与域名不匹配（curl 60），必须 verify=false；正文在 .article-content"
     },
     {
@@ -42,6 +94,38 @@
       "title_selector": "h1",
       "body_selector": ".article-content",
       "limit": 5,
+      "min_body_length": 60,
+      "search": {
+        "type": "api",
+        "method": "GET",
+        "url": "http://mod-search.mod.gov.cn/api-surface/es/docSearchEasy",
+        "verify": false,
+        "proxy": false,
+        "timeout": 25,
+        "params": {
+          "pageNumber": "{page}",
+          "pageSize": 10,
+          "returnFields": "",
+          "indexNames": "manuscript",
+          "highlightType": 2,
+          "title": "{keyword}",
+          "searchType": 2,
+          "channelId": 718
+        },
+        "pages": 5,
+        "page_start": 1,
+        "items_path": "data.resultList",
+        "total_path": "data.total",
+        "title_field": "title",
+        "url_field": "manuscriptData.url",
+        "date_field": "issueTime",
+        "summary_field": "desc",
+        "category_field": "manuscriptData.classify_name",
+        "link_re": "mod\\.gov\\.cn/gfbw/.+\\d{6,}\\.html$",
+        "url_prefixes": ["/gfbw/"],
+        "search_by": "title（复用 mod 的后端与 channelId）",
+        "note": "接口没有「只搜记者会栏目」的参数：复用 718 后按 link_re + url_prefixes 只留 /gfbw/ 命中"
+      },
       "note": "同上；记者会/权威发布都在 /gfbw/ 下"
     },
     {
@@ -52,10 +136,40 @@
       "engine": "static",
       "verify": false,
       "list_selector": "ul.news-list li a",
-      "link_re": "81\\.mil\\.cn/.+\\d{6,}\\.html$",
+      "link_re": "81\\.(mil\\.cn|cn)/.+\\d{6,}\\.html$",
       "title_selector": "h1",
       "body_selector": "#article-content",
       "limit": 5,
+      "search": {
+        "type": "api",
+        "method": "GET",
+        "url": "http://mil-search.81.cn/api-surface/es/docSearchEasy",
+        "verify": false,
+        "proxy": false,
+        "timeout": 25,
+        "params": {
+          "pageNumber": "{page}",
+          "pageSize": 10,
+          "returnFields": "",
+          "indexNames": "manuscript",
+          "highlightType": 2,
+          "title": "{keyword}",
+          "searchType": 2,
+          "channelId": 636
+        },
+        "pages": 5,
+        "page_start": 1,
+        "items_path": "data.resultList",
+        "total_path": "data.total",
+        "title_field": "title",
+        "url_field": "manuscriptData.url",
+        "date_field": "issueTime",
+        "summary_field": "desc",
+        "category_field": "manuscriptData.classify_name",
+        "link_re": "81\\.(mil\\.cn|cn)/.+\\d{6,}\\.html$",
+        "search_by": "title（channelId 636=中国军网）",
+        "note": "军网有自有检索后端 mil-search.81.cn（不是 mod-search）；接口返回的是 www.81.cn 而不是 81.mil.cn，link_re 必须同时容纳两者"
+      },
       "note": "证书同样不匹配，verify=false；正文容器是 #article-content"
     },
     {
@@ -70,6 +184,17 @@
       "title_selector": "div.news-title, h1",
       "body_selector": "div#News_Body_Txt_A, div.TRS_UEDITOR",
       "limit": 5,
+      "search": {
+        "type": "browser",
+        "verify": true,
+        "proxy": false,
+        "url_template": "https://www.fmprc.gov.cn/irs-c-web/search.shtml?code=17e50b77dab&searchBy=title&searchWord={keyword}",
+        "link_re": "fmprc\\.gov\\.cn/.+/t20\\d{6}_\\d+\\.shtml$",
+        "search_by": "searchBy=title（IRS 平台）",
+        "unavailable": true,
+        "unavailable_reason": "IRS 检索页 GET 只服务端渲染出 0 条结果；真正的接口 POST /irs/front/search 缺 searchRequestId(UUID) 与有效凭证（code 1000/1004），静态方式拿不到结果",
+        "note": "配置留档：等 IRS 凭证流程解决后再启用。目前运行时直接回退列表页"
+      },
       "note": "文章 URL 有固定形态 t<日期>_<id>.shtml，直接用 link_re 过滤最稳；正文在 #News_Body_Txt_A"
     },
     {
@@ -84,6 +209,10 @@
       "title_selector": "div.section-cnt-tit, h1",
       "body_selector": "div.trs_editor_view, div.article-main",
       "limit": 5,
+      "search": {
+        "type": "none",
+        "note": "站内检索确认不可用：跳转页 /js/index.html?q=… 结果数恒为 0；后端 POST /irs/front/search 静态重试与真实浏览器点击全部 404；api./search./so.ccg.gov.cn 均 DNS 不解析"
+      },
       "note": "首页列表是 ul.text-news > li.text-news-item；正文在 .trs_editor_view（TRS 编辑器）"
     },
     {
@@ -98,7 +227,13 @@
       "title_selector": "div.section-cnt-tit, h1",
       "body_selector": "div.trs_editor_view, div.article-main",
       "limit": 5,
-      "note": "专栏用 /wqzf/（带 index.html 的地址会超时，用目录形式）；有分页 index_1.html…index_23.html"
+      "list_pages": 3,
+      "page_url_template": "https://www.ccg.gov.cn/wqzf/index_{page}.html",
+      "search": {
+        "type": "none",
+        "note": "站点级检索与 ccg 同一个（且不可用）；栏目页 /wqzf/ 无检索表单"
+      },
+      "note": "专栏用 /wqzf/（带 index.html 的地址会超时，用目录形式）；分页实测 2026-11-20（gov_news/out/probe_list_pagination_ccg_wqzf_*.json）：/wqzf/ 与 /wqzf/index.html 都是 200 且 19 条候选（含底部「点击排行」重复区），index_1.html=200/29 条、index_2.html=200/29 条、index_23.html=200/19 条，index_0.html / index_24.html / index_25.html 均 404 —— 所以有效分页是 index_1.html…index_23.html（23 页）。page_url_template 直接用 index_{page}.html 形态、从第 1 页起取，不再抓 /wqzf/ 目录页：目录页多出来的都是「点击排行」里与栏目列表重复的链接（翻页合并时会被去重），反而多一次请求"
     },
     {
       "key": "scspi",
@@ -107,12 +242,26 @@
       "enabled": true,
       "engine": "browser",
       "verify": true,
+      "proxy": true,
       "list_selector": "a",
       "link_re": "scspi\\.org/zh/(yjbg|dtfx|zdhd|militaryposture|maritimepolicies|marinedevelopment|rulesandorder)/\\d+",
       "title_selector": "h1",
       "body_selector": "div.field--name-body, div.node__content, article",
       "limit": 3,
-      "note": "静态请求 SSL/连接异常，必须用浏览器；文章 URL 无扩展名（/zh/分类/时间戳），靠 link_re 过滤"
+      "search": {
+        "type": "results_page",
+        "method": "GET",
+        "verify": true,
+        "proxy": true,
+        "timeout": 25,
+        "url_template": "https://www.scspi.org/zh/sitesearch?keywords={keyword}",
+        "list_selector": "a",
+        "link_re": "scspi\\.org/zh/(yjbg|dtfx|zdhd|militaryposture|maritimepolicies|marinedevelopment|rulesandorder)/\\d+",
+        "pages": 1,
+        "search_by": "keywords（站点简单检索，全文匹配，没有仅标题选项）",
+        "note": "结果页链接是相对路径，实现按结果页 URL 补全；实测不加代理 3/3 超时，必须 --proxy http://127.0.0.1:7897；结果页没有可用翻页参数"
+      },
+      "note": "静态请求 SSL/连接异常，必须用浏览器；文章 URL 无扩展名（/zh/分类/时间戳），靠 link_re 过滤；**必须代理**"
     },
     {
       "key": "nanhai",
@@ -126,6 +275,10 @@
       "title_selector": "h1",
       "body_selector": "div.textHer",
       "limit": 5,
+      "search": {
+        "type": "none",
+        "note": "首页/内页有 <form action=/search.html method=get> + name=keywords，但服务端不产出任何结果条目（两个关键词都是 0 条，页面无检索脚本），判定为空壳"
+      },
       "note": "正文在 div.textHer（外层 #div_content 会带标题和来源行）"
     },
     {
@@ -140,6 +293,26 @@
       "title_selector": "h1, title",
       "body_selector": "span#detailContent, div#detail",
       "limit": 5,
+      "search": {
+        "type": "browser",
+        "verify": true,
+        "proxy": false,
+        "url_template": "https://so.news.cn/",
+        "page_start": 1,
+        "pages": 2,
+        "js_fetch": {
+          "url_template": "https://so.news.cn/getNews?lang=cn&curPage={page}&searchFields=0&sortField=0&keyword={keyword}"
+        },
+        "items_path": "content.results",
+        "total_path": "content.resultCount",
+        "title_field": "title",
+        "url_field": "url",
+        "date_field": "pubtime",
+        "summary_field": "des",
+        "link_re": "news\\.cn/.+/c\\.html$",
+        "search_by": "searchFields（so.news.cn 检索）",
+        "note": "底层接口 so.news.cn/getNews 静态直调恒 403（openresty），只能由页面自身发起：先打开 so.news.cn 基础页，再在页面上下文里 fetch getNews（页面里 fetch 实测 curPage=1/2 与不同关键词都返回 200）。检索页是 hash 路由，直接改 hash 翻页会被 Playwright 判为同文档导航而拿不到响应，故不用 hash 导航。浏览器型检索每页一次导航，故 pages 默认只给 2；实测连续多页/多源调用该接口会偶发 503（风控限流），按页记错并回退列表页，--delay 调大只能缓解"
+      },
       "note": "文章 URL 以 /c.html 结尾；h1 常为空，用 #detail 兜底；正文在 span#detailContent"
     },
     {
@@ -154,6 +327,44 @@
       "title_selector": "h1",
       "body_selector": "div#rm_txt_zw, div.rm_txt_con",
       "limit": 5,
+      "search": {
+        "type": "api",
+        "method": "POST",
+        "url": "http://search.people.cn/search-platform/front/search",
+        "verify": true,
+        "proxy": false,
+        "timeout": 25,
+        "headers": {
+          "Content-Type": "application/json;charset=UTF-8",
+          "Origin": "http://search.people.cn",
+          "Referer": "http://search.people.cn/s/"
+        },
+        "body": {
+          "key": "{keyword}",
+          "page": "{page}",
+          "limit": 10,
+          "hasTitle": true,
+          "hasContent": true,
+          "isFuzzy": true,
+          "type": 0,
+          "sortType": 2,
+          "startTime": 0,
+          "endTime": 0,
+          "belongsId": []
+        },
+        "pages": 5,
+        "page_start": 1,
+        "items_path": "data.records",
+        "total_path": "data.total",
+        "title_field": "title",
+        "url_field": "url",
+        "date_field": "inputTime",
+        "summary_field": "content",
+        "category_field": "belongsName",
+        "link_re": "people\\.com\\.cn/n\\d/\\d{4}/\\d{4}/c\\d+-\\d+\\.html$",
+        "search_by": "hasTitle=true（配 hasContent/isFuzzy）",
+        "note": "返回的 title 与 content 里带 <em>南海</em> 高亮标签，入库前必须 strip_html；type/belongsId 传值不改变结果，频道筛选改用最终 URL 的域名"
+      },
       "note": "首页聚合了多个 ul 列表；正文在 #rm_txt_zw"
     },
     {
@@ -164,11 +375,22 @@
       "engine": "static",
       "verify": true,
       "list_selector": "div.text.hover a, div.text div.title a, li div.title a",
-      "link_re": "tv\\.cctv\\.com/\\d{4}/\\d{2}/\\d{2}/VIDE.+\\.shtml$",
+      "link_re": "tv\\.cctv\\.com/\\d{4}/\\d{2}/\\d{2}/VID[A-Za-z0-9]+\\.shtml$",
       "title_selector": "div.tit, h1, title",
       "body_selector": "div.video_brief",
       "limit": 5,
-      "note": "视频页没有长正文，正文等于 div.video_brief 里的节目简介（已注明）"
+      "search": {
+        "type": "browser",
+        "verify": true,
+        "proxy": false,
+        "url_template": "https://search.cctv.com/search.php?qtext={keyword}&type=web",
+        "link_re": "tv\\.cctv\\.com/\\d{4}/\\d{2}/\\d{2}/VID[A-Za-z0-9]+\\.shtml$",
+        "search_by": "qtext（不区分标题/全文）",
+        "unavailable": true,
+        "unavailable_reason": "结果列表取不到：静态 HTML 只有空 playlistArray；StealthySession 渲染后也没有结果条目、抓不到取数 XHR（页面文本里只有「共 N 条」总数）",
+        "note": "配置留档：已按调研结论放弃站内检索，运行时直接回退列表页。若将来找到取数接口再补 xhr_url_re"
+      },
+      "note": "视频页没有长正文，正文等于 div.video_brief 里的节目简介（已注明）；link_re 已放宽到 VID[A-Za-z0-9]+（实测 2026-11-20 的链接形如 VIDEjRRYczjjaRgmVYUa7Zfj261119，含大小写，只写 VIDE 或只写 VID[A-Z0-9]+ 都会漏）"
     },
     {
       "key": "xinhua_mil",
@@ -182,6 +404,27 @@
       "title_selector": "h1, title",
       "body_selector": "span#detailContent, div#detail",
       "limit": 5,
+      "search": {
+        "type": "browser",
+        "verify": true,
+        "proxy": false,
+        "url_template": "https://so.news.cn/",
+        "page_start": 1,
+        "pages": 1,
+        "js_fetch": {
+          "url_template": "https://so.news.cn/getNews?lang=cn&curPage={page}&searchFields=0&sortField=0&keyword={keyword}"
+        },
+        "items_path": "content.results",
+        "total_path": "content.resultCount",
+        "title_field": "title",
+        "url_field": "url",
+        "date_field": "pubtime",
+        "summary_field": "des",
+        "link_re": "news\\.cn/milpro/.+/c\\.html$",
+        "url_prefixes": ["https://www.news.cn/milpro/"],
+        "search_by": "复用父站 xinhua 的检索 + URL 前缀过滤",
+        "note": "栏目 /milpro/ 首页无 form、无检索入口（实测 forms=0/search_links=0），只能复用父站检索后按前缀过滤；**2026-11-20 实测 5 页×2 词约 100 条结果里 /milpro/ 命中 0 条**，所以它多数情况会回退列表页（列表候选 106）。pages 给 1 省时间，想搏命中率用 --search-pages 调大"
+      },
       "note": "比新华网首页命中率高得多（首页排的是时政要闻）"
     },
     {
@@ -196,6 +439,45 @@
       "title_selector": "h1",
       "body_selector": "div#rm_txt_zw, div.rm_txt_con",
       "limit": 5,
+      "search": {
+        "type": "api",
+        "method": "POST",
+        "url": "http://search.people.cn/search-platform/front/search",
+        "verify": true,
+        "proxy": false,
+        "timeout": 25,
+        "headers": {
+          "Content-Type": "application/json;charset=UTF-8",
+          "Origin": "http://search.people.cn",
+          "Referer": "http://search.people.cn/s/"
+        },
+        "body": {
+          "key": "{keyword}",
+          "page": "{page}",
+          "limit": 10,
+          "hasTitle": true,
+          "hasContent": true,
+          "isFuzzy": true,
+          "type": 0,
+          "sortType": 2,
+          "startTime": 0,
+          "endTime": 0,
+          "belongsId": []
+        },
+        "pages": 5,
+        "page_start": 1,
+        "items_path": "data.records",
+        "total_path": "data.total",
+        "title_field": "title",
+        "url_field": "url",
+        "date_field": "inputTime",
+        "summary_field": "content",
+        "category_field": "belongsName",
+        "link_re": "military\\.people\\.com\\.cn/n\\d/\\d{4}/\\d{4}/c\\d+-\\d+\\.html$",
+        "url_prefixes": ["military.people.com.cn"],
+        "search_by": "复用 people 的接口 + 域名过滤（belongsId 频道过滤实测不生效）",
+        "note": "栏目页的 form action=search.people.cn/getNewsResult 返回的是 SPA 外壳而不是结果；标题/摘要同样带 <em> 高亮，必须 strip_html"
+      },
       "note": "军事频道，正文容器与人民网主站一致"
     },
     {
@@ -210,21 +492,52 @@
       "title_selector": "h1, title",
       "body_selector": "span#detailContent, div#detail",
       "limit": 5,
+      "search": {
+        "type": "browser",
+        "verify": true,
+        "proxy": false,
+        "url_template": "https://so.news.cn/",
+        "page_start": 1,
+        "pages": 2,
+        "js_fetch": {
+          "url_template": "https://so.news.cn/getNews?lang=cn&curPage={page}&searchFields=0&sortField=0&keyword={keyword}"
+        },
+        "items_path": "content.results",
+        "total_path": "content.resultCount",
+        "title_field": "title",
+        "url_field": "url",
+        "date_field": "pubtime",
+        "summary_field": "des",
+        "link_re": "news\\.cn/world/.+/c\\.html$",
+        "url_prefixes": ["https://www.news.cn/world/"],
+        "search_by": "复用父站 xinhua 的检索 + URL 前缀过滤",
+        "note": "栏目 /world/ 首页无 form、无检索入口（实测 forms=0/search_links=0），同 xinhua_mil；2026-11-20 实测 2 页×2 词未命中 /world/ 前缀（且其中一次取数接口 503 限流），页数少时基本会回退列表页"
+      },
       "note": "国际新闻频道，涉海/周边报道多"
     },
     {
       "key": "mod_search_scs",
       "name": "国防部网·站内检索(南海)",
       "url": "http://www.mod.gov.cn/",
-      "enabled": true,
-      "engine": "api",
+      "enabled": false,
+      "deprecated": true,
+      "deprecated_note": "已被 mod 的通用检索（search 块 + keywords.json 统一词表）取代；启用它会与 mod 重复入库，故置 enabled=false 留档",
+      "engine": "static",
       "verify": false,
       "detail_engine": "static",
       "detail_verify": false,
-      "skip_keyword_filter": true,
-      "api": {
+      "list_selector": "ul.news-list li a",
+      "link_re": "mod\\.gov\\.cn/.+\\d{6,}\\.html$",
+      "title_selector": "h1",
+      "body_selector": ".article-content",
+      "limit": 20,
+      "min_body_length": 60,
+      "search": {
+        "type": "api",
+        "method": "GET",
         "url": "http://mod-search.mod.gov.cn/api-surface/es/docSearchEasy",
         "verify": false,
+        "proxy": false,
         "timeout": 25,
         "params": {
           "pageNumber": "{page}",
@@ -236,23 +549,20 @@
           "searchType": 2,
           "channelId": 718
         },
-        "search_keywords": [
-          "南海"
-        ],
-        "pages": 10,
+        "pages": 5,
+        "page_start": 1,
         "items_path": "data.resultList",
         "total_path": "data.total",
         "title_field": "title",
         "url_field": "manuscriptData.url",
         "date_field": "issueTime",
-        "desc_field": "desc",
-        "category_field": "manuscriptData.classify_name"
+        "summary_field": "desc",
+        "category_field": "manuscriptData.classify_name",
+        "link_re": "mod\\.gov\\.cn/.+\\d{6,}\\.html$",
+        "search_by": "title",
+        "note": "保留原条目的检索参数；检索词已统一走 keywords.json 的 global，不再用固定词『南海』"
       },
-      "title_selector": "h1",
-      "body_selector": ".article-content",
-      "limit": 20,
-      "note": "engine=api：直接调它自己的站内检索接口 mod-search.mod.gov.cn/api-surface/es/docSearchEasy（从 index.js 里扒出来的）。title 参数=按标题检索，searchType 2=模糊匹配，channelId 718=国防部网主站。skip_keyword_filter=true 因为服务端已经按关键词筛过。改关键词就改 search_keywords（可用多个，逐个查再合并）；pages 是每个关键词翻几页（每页 10 条）；min_body_length=60 用来丢掉「记者会索引页/图片快讯」这类空壳（正文其实在子链接里）",
-      "min_body_length": 60
+      "note": "deprecated：这个源最初是「把国防部网检索接口当列表页」的实验，现已并入 mod 的通用检索机制；保留条目与参数供追溯，默认不跑"
     }
   ]
 }

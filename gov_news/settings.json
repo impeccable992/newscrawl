@@ -1,0 +1,24 @@
+{
+  "_readme": [
+    "每轮运行的全局参数。优先级：命令行 > settings.json > 源配置(sources.json) > 代码内置默认。",
+    "本文件不存在时不报错：全部走源配置/内置默认（启用 --settings 指向别处即可换一套参数）。",
+    "search_pages   每个检索词翻几页（上限 20，--search-pages 可临时覆盖）",
+    "search_limit   检索阶段每个源最多收集多少候选；0 或负数 = 不设上限，但仍有 5000 条硬护栏",
+    "fetch_limit    每个源最多抓多少篇详情（--fetch-limit/--limit 可临时覆盖；只截取、不影响收集）",
+    "list_pages     回退列表页最多翻几页（源可用 list_pages 单独覆盖，--list-pages 可临时覆盖）",
+    "delay_seconds  请求间隔秒数，必须 ≥1（对国内站点的礼貌间隔）",
+    "timeout_seconds 单个请求超时秒数（source.search.timeout 可单独覆盖检索请求）",
+    "proxy          代理地址；**只对 sources.json 里 search.proxy=true 的源生效**（目前只有 scspi）",
+    "db             入库连接参数；**这里不放密码**，密码走 --db-password 或 GOV_NEWS_DB_PASSWORD 环境变量",
+    "source_overrides 单源覆盖（如 xinhua 走浏览器，单源调小 fetch_limit）"
+  ],
+  "search_pages": 5,
+  "search_limit": 300,
+  "fetch_limit": 50,
+  "list_pages": 3,
+  "delay_seconds": 1.0,
+  "timeout_seconds": 30,
+  "proxy": "",
+  "db": { "name": "newscrawl", "host": "127.0.0.1", "port": 3306, "user": "root" },
+  "source_overrides": { "xinhua": { "fetch_limit": 20 }, "cctv": { "fetch_limit": 10 } }
+}
